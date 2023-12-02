@@ -6,15 +6,18 @@ import matplotlib.pyplot as plt
 from datetime import timedelta
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error
+from sklearn.svm import SVR
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
+from sklearn.ensemble import RandomForestRegressor
 
 
 class PortfolioOptimizer:
-    def __init__(self, start_date, end_date, test_start_date, test_end_date, sharpe_windows):
+    def __init__(self, start_date, end_date, test_start_date, test_end_date):
         self.start_date = pd.to_datetime(start_date)
         self.end_date = pd.to_datetime(end_date)
         self.test_start_date = pd.to_datetime(test_start_date)
         self.test_end_date = pd.to_datetime(test_end_date)
-        self.sharpe_windows = sharpe_windows
         self.prices_df = None  # DataFrame to store stock prices
         self.returns_df = None
         self.excess_returns_df = pd.DataFrame()
@@ -43,43 +46,106 @@ class PortfolioOptimizer:
         self.logreturns_df = self.logreturns_df.dropna()
         self.symbols = symbols
 
-    def predict_returns(self, method="Markowitz"):
-        df = self.excess_returns_df
-        dates = []
+    def predict_returns(self, method="Markowitz", lag_size=10, restrict=False, symbol="TIP", window=252*5):
+        df = self.excess_returns_df.dropna()
+        test_dates = []
         for date in pd.date_range(start=self.test_start_date, end=self.test_end_date):
             if date in df.index:
-                dates.append(date)
-        predicted_returns = pd.DataFrame()
-        real = df.loc[df.index.isin(dates)]
+                test_dates.append(date)
+        predicted_returns = pd.DataFrame(index=test_dates)
+        real = df.loc[df.index.isin(test_dates)]
         if method == "Markowitz":
-            window = 5*252
-            for date in dates:
+            for date in test_dates:
                 start_idx = df.index.get_loc(date) - window
                 end_idx = df.index.get_loc(date)
                 window_data = df.iloc[start_idx:end_idx]
-                for symbol in self.symbols:
-                    predicted_returns.loc[date, symbol] = window_data[symbol].mean()
-        if method == "Regression":
-            train_start_date = "2010-01-01"
-            train_end_date = "2015-12-31"
-            df = self.excess_returns_df
-            df = df.dropna()
-            lag_size = 10
-            model = LinearRegression()
-            predicted_returns = pd.DataFrame(index=dates)
-            for target in df.columns:
-                df['Target'] = df[target].shift(-lag_size)
-                features = []
-                for i in range(lag_size):
-                    features.append(f'{target}_lag_{i}')
-                    df[f'{target}_lag_{i}'] = df[target].shift(i)
-                train_data = df[(df.index >= train_start_date) & (df.index <= train_end_date)]
-                test_data = df[(df.index >= self.test_start_date) & (df.index <= self.test_end_date)]
-                X_train = train_data.iloc[lag_size:][features]
-                y_train = train_data.iloc[lag_size:]['Target']
+                predicted_returns.loc[date, symbol] = window_data[symbol].mean()
+        else:
+            data = pd.DataFrame(index=self.excess_returns_df.index)
+            train_data = pd.DataFrame()
+            test_data = pd.DataFrame()
+            data['Target'] = df[symbol]
+            features = []
+            for i in range(lag_size):
+                features.append(f'{symbol}_lag_{i + 1}')
+                data[f'{symbol}_lag_{i + 1}'] = df[symbol].shift(i + 1)
+            train_start_date = pd.to_datetime(self.start_date)
+            test_start_date = pd.to_datetime(self.test_start_date)
+            test_end_date = pd.to_datetime(self.test_end_date)
+            while test_start_date <= test_end_date:
+                yield data[(data.index >= train_start_date) & (data.index < test_start_date)].dropna(), data[
+                    (data.index >= test_start_date) & (data.index < test_start_date + pd.DateOffset(years=1))].dropna()
+                train_start_date += pd.DateOffset(years=1)
+                test_start_date += pd.DateOffset(years=1)
+            X_train = train_data[features]
+            y_train = train_data['Target']
+            X_test = test_data[features]
+            if method == "Regression":
+                model = LinearRegression()
+                model.fit(X_train, y_train)
+                predicted_returns[symbol] = model.predict(X_test)
+            if method == "SVR":
+                scaler = StandardScaler()
+                target_scaler = StandardScaler()
+                y_train = target_scaler.fit_transform(y_train.values.reshape(-1, 1)).ravel()
+                if restrict:
+                    for feature in features:
+                        d = X_train[feature]
+                        dm = d.median()
+                        dmm = d.sub(dm).abs().median()
+                        X_train.loc[X_train[feature] > dm + 5 * dmm, feature] = dm + 5 * dmm
+                        X_train.loc[X_train[feature] < dm - 5 * dmm, feature] = dm - 5 * dmm
+                        d = X_test[feature]
+                        dm = d.median()
+                        dmm = d.sub(dm).abs().median()
+                        X_test.loc[X_test[feature] > dm + 5 * dmm, feature] = dm + 5 * dmm
+                        X_test.loc[X_test[feature] < dm - 5 * dmm, feature] = dm - 5 * dmm
+                scaler.fit(X_train)
+                X_train = scaler.transform(X_train)
+                X_test = scaler.transform(X_test)
+                # param_grid = {'C': [2**x for x in range(6)], 'gamma': [2**x for x in range(-5, 1)]}
+                # grid_search = GridSearchCV(estimator=SVR(kernel='rbf'), param_grid=param_grid, cv=3,
+                #                           scoring='neg_mean_squared_error')
+                # grid_search.fit(X_train, y_train)
+                # opt_C = grid_search.best_params_.get("C")
+                # opt_g = grid_search.best_params_.get("gamma")
+                # print(symbol, opt_C, opt_g)
+                opt_C, opt_g = 1, 1
+                if symbol == "VTV":
+                    opt_g = 0.03125
+                model = SVR(C=opt_C, kernel='rbf', gamma=opt_g)
+                model.fit(X_train, y_train)
+                pred = model.predict(X_test).reshape(1, -1)
+                pred = target_scaler.inverse_transform(pred)
+                predicted_returns[symbol] = pred.reshape(-1, 1)
+            if method == "RF":
+                # param_grid = {'max_depth': [5 * x for x in range(3, 5)], 'min_samples_split': [5 * x for x in range(1, 3)],
+                #              'min_samples_leaf': [5 * x for x in range(1, 3)]}
+                # random_search = RandomizedSearchCV(estimator=RandomForestRegressor(random_state=42),
+                #                                  param_distributions=param_grid, cv=3, scoring='neg_mean_squared_error',
+                #                                   n_iter=4, random_state=42, n_jobs=-1)
+                # random_search.fit(X_train, y_train)
+                # opt_depth = random_search.best_params_.get("max_depth")
+                # opt_split = random_search.best_params_.get("min_samples_split")
+                # opt_leaf = random_search.best_params_.get("min_samples_leaf")
+                #opt_features = random_search.best_params_.get("max_features"
+                if symbol in ['TIP', 'IEF', 'GLD']:
+                    opt_depth = 20
+                else:
+                    opt_depth = 15
+                if symbol in ['TIP', 'GLD']:
+                    opt_leaf = 10
+                else:
+                    opt_leaf = 5
+                model = RandomForestRegressor(n_estimators=500, max_depth=opt_depth, min_samples_split=10,
+                                              min_samples_leaf=opt_leaf)
                 model.fit(X_train, y_train)
                 X_test = test_data[features]
-                predicted_returns[target] = model.predict(X_test)
+                predicted_returns[symbol] = model.predict(X_test)
+            if method == "rnd":
+                for date in test_dates:
+                    for symbol in self.symbols:
+                        predicted_returns.loc[date, symbol] = np.random.normal(0, 0.1 / 250)
         return predicted_returns, real
 
     def optimize_portfolio(self, method="Regression"):
@@ -115,10 +181,22 @@ class PortfolioOptimizer:
             return optimal_weights_df, portfolio_values
 
     def plot_results(self, method="Markowitz"):
-            optimal_weights_df, portfolio_values = self.optimize_portfolio(method)
-            portfolio_values.plot()
-            optimal_weights_df.plot(kind="bar", stacked=True, width=1)
-            locs, labels = plt.xticks()
-            plt.xticks(ticks=locs[0:-1:21], labels=optimal_weights_df.index[0:-1:21].month,
-                       rotation="horizontal")
-            plt.show()
+        optimal_weights_df, portfolio_values = self.optimize_portfolio(method)
+        portfolio_values.plot()
+        optimal_weights_df.plot(kind="bar", stacked=True, width=1)
+        locs, labels = plt.xticks()
+        plt.xticks(ticks=locs[0:-1:21], labels=optimal_weights_df.index[0:-1:21].month,
+                   rotation="horizontal")
+        plt.show()
+
+    def create_prediction_df(self, methods, lag_size=10, restrict=False, symbol="TIP"):
+        predictions = pd.DataFrame()
+        for method in methods:
+            preds, real = self.predict_returns(method, lag_size, restrict, symbol)
+            preds, real = preds[symbol], real[symbol]
+            predictions[method] = preds
+        return predictions, real
+
+    def predict_rolled_returns(self, method, lag_size=10, restrict=False, symbol="TIP"):
+
+        pass
